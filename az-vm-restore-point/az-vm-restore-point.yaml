@@ -1,0 +1,377 @@
+trigger:
+  - none
+
+pr:
+  - none
+
+# Parameters (compile-time) for user-controlled actions / naming.
+parameters:
+  - name: action
+    displayName: Action to perform
+    type: string
+    default: both
+    values: [create, restore, both]
+  - name: newRestorePointName
+    displayName: New restore point name (if creating)
+    type: string
+    default: myNewRestorePoint
+  - name: existingRestorePointName
+    displayName: Existing restore point name (if restoring)
+    type: string
+    default: myExistingRestorePoint
+  - name: startVmAfterRestore
+    displayName: Start VM after restore?
+    type: boolean
+    default: false
+  - name: includeDataDisks
+    displayName: Include data disks when restoring?
+    type: boolean
+    default: true
+
+variables:
+  - group: "Azure-VM-Variables" # Contains per-VM namespaced keys and curated list context
+  - name: "vm_name" # Kept as a variable deliberately: curated list managed via variable group or queue-time override
+  - name: "azure_service_connection" # Azure service connection name in Azure DevOps
+    value: "myServiceConnection"
+
+  # --- Namespaced Variable Group Pattern (Do NOT declare these here; they live in the variable group) ---
+  # For each VM you support, add the following variables INSIDE the 'Azure-VM-Variables' variable group:
+  #   VM_<VMKEY>_RESOURCE_GROUP            e.g. VM_MYVM_RESOURCE_GROUP=rg-myvmprod
+  #   VM_<VMKEY>_SUBSCRIPTION              e.g. VM_MYVM_SUBSCRIPTION=00000000-0000-0000-0000-000000000000 (or friendly name)
+  #   VM_<VMKEY>_LOCATION                  e.g. VM_MYVM_LOCATION=uksouth
+  #   VM_<VMKEY>_RPC                       e.g. VM_MYVM_RPC=rpc-myvm
+  # Where <VMKEY> corresponds to the value you set for vm_name (case-insensitive; will be uppercased for lookup).
+  # Example additional VM: VM_WEB01_RESOURCE_GROUP, VM_WEB01_SUBSCRIPTION, VM_WEB01_LOCATION, VM_WEB01_RPC
+  # You may also add future keys (e.g. VM_<VMKEY>_AUTOSTART_DEFAULT) and extend the script accordingly.
+
+stages:
+  - stage: "VM_Restore_Point_Management"
+    displayName: "VM Restore Point Management"
+    jobs:
+      - job: "Manage_Restore_Points"
+        displayName: "Create and/or Restore VM Restore Points"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Manage VM Restore Points"
+            inputs:
+              azureSubscription: "$(azure_service_connection)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                set -e
+                # Ensure jq is installed (used for parsing JSON restore point data)
+                if ! command -v jq >/dev/null 2>&1; then
+                  echo "jq not found. Installing jq..."
+                  sudo apt-get update -y >/dev/null 2>&1 || sudo apt-get update -y
+                  sudo apt-get install -y jq >/dev/null 2>&1 || sudo apt-get install -y jq
+                  if ! command -v jq >/dev/null 2>&1; then
+                    echo "ERROR: Failed to install jq." >&2
+                    exit 1
+                  fi
+                  echo "jq installed successfully."
+                else
+                  echo "jq already present."
+                fi
+                echo "Starting VM Restore Point Management"
+
+                ACTION='${{ parameters.action }}'
+                NEW_RP_NAME='${{ parameters.newRestorePointName }}'
+                EXISTING_RP_NAME='${{ parameters.existingRestorePointName }}'
+                START_AFTER='${{ parameters.startVmAfterRestore }}'
+                INCLUDE_DATA='${{ parameters.includeDataDisks }}'
+                VM_KEY_RAW="$(vm_name)"
+
+                # Uppercase the VM key for consistent variable name construction
+                VM_KEY=$(echo "$VM_KEY_RAW" | tr '[:lower:]' '[:upper:]')
+
+                # Construct expected variable names coming from the variable group
+                RG_VAR="VM_${VM_KEY}_RESOURCE_GROUP"
+                SUB_VAR="VM_${VM_KEY}_SUBSCRIPTION"
+                LOC_VAR="VM_${VM_KEY}_LOCATION"
+                RPC_VAR="VM_${VM_KEY}_RPC"
+
+                # Resolve their values (indirect expansion); if empty, fail fast
+                RESOURCE_GROUP=${!RG_VAR}
+                SUBSCRIPTION=${!SUB_VAR}
+                LOCATION=${!LOC_VAR}
+                RESTORE_POINT_COLLECTION=${!RPC_VAR}
+
+                missing=()
+                [[ -z "$RESOURCE_GROUP" ]] && missing+=("$RG_VAR")
+                [[ -z "$SUBSCRIPTION" ]] && missing+=("$SUB_VAR")
+                [[ -z "$LOCATION" ]] && missing+=("$LOC_VAR")
+                [[ -z "$RESTORE_POINT_COLLECTION" ]] && missing+=("$RPC_VAR")
+                if (( ${#missing[@]} > 0 )); then
+                  echo "ERROR: Missing required variable group entries: ${missing[*]}" >&2
+                  exit 1
+                fi
+
+                echo "Resolved metadata for VM '$VM_KEY_RAW':"
+                echo "  Resource Group: $RESOURCE_GROUP"
+                echo "  Subscription:   $SUBSCRIPTION"
+                echo "  Location:       $LOCATION"
+                echo "  RPC:            $RESTORE_POINT_COLLECTION"
+
+                # --- Regex validation for restore point names ---
+                validate_rp_name() {
+                  local n="$1"; local label="$2"
+                  if [[ -z "$n" ]]; then echo "ERROR: $label is empty" >&2; exit 1; fi
+                  if [[ ! $n =~ ^[A-Za-z0-9-]{1,80}$ ]]; then
+                    echo "ERROR: $label '$n' invalid. Must match ^[A-Za-z0-9-]{1,80}$ (alphanumeric & hyphen)." >&2; exit 1; fi
+                }
+                if [[ "$ACTION" == "create" || "$ACTION" == "both" ]]; then
+                  validate_rp_name "$NEW_RP_NAME" new_restore_point_name; fi
+                if [[ "$ACTION" == "restore" || "$ACTION" == "both" ]]; then
+                  validate_rp_name "$EXISTING_RP_NAME" existing_restore_point_name; fi
+                if [[ "$ACTION" == "both" && "$NEW_RP_NAME" == "$EXISTING_RP_NAME" ]]; then
+                  echo "ERROR: new_restore_point_name and existing_restore_point_name must differ when action=both" >&2; exit 1; fi
+
+                echo "Setting Azure subscription context..."
+                az account set --subscription "$SUBSCRIPTION"
+
+                shutdown_vm() {
+                  echo "Checking VM power state..."
+                  local state
+                  state=$(az vm get-instance-view -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" --query 'instanceView.statuses[?starts_with(code, `PowerState/`)].code' -o tsv 2>/dev/null || echo unknown)
+                  echo "Current power state: ${state:-unknown}"
+                  if [[ "$state" == "PowerState/deallocated" ]]; then
+                    echo "VM already deallocated; skipping deallocate step."
+                    return 0
+                  fi
+                  echo "Deallocating VM $VM_KEY_RAW ..."
+                  az vm deallocate --resource-group "$RESOURCE_GROUP" --name "$VM_KEY_RAW" --no-wait || true
+                  az vm wait --resource-group "$RESOURCE_GROUP" --name "$VM_KEY_RAW" --deallocated
+                  local final_state
+                  final_state=$(az vm get-instance-view -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" --query 'instanceView.statuses[?starts_with(code, `PowerState/`)].code' -o tsv 2>/dev/null || echo unknown)
+                  echo "Final power state: ${final_state:-unknown}"
+                  if [[ "$final_state" != "PowerState/deallocated" ]]; then
+                    echo "ERROR: VM failed to reach deallocated state." >&2
+                    exit 1
+                  fi
+                  echo "VM deallocated successfully."
+                }
+
+                # Ensure Restore Point Collection exists (idempotent)
+                ensure_rpc_exists() {
+                  if ! az restore-point collection show -g "$RESOURCE_GROUP" -n "$RESTORE_POINT_COLLECTION" >/dev/null 2>&1; then
+                    echo "Restore Point Collection '$RESTORE_POINT_COLLECTION' not found. Creating..."
+                    VM_ID=$(az vm show -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" --query id -o tsv)
+                    az restore-point collection create \
+                      --resource-group "$RESOURCE_GROUP" \
+                      --name "$RESTORE_POINT_COLLECTION" \
+                      --source-id "$VM_ID" \
+                      --location "$LOCATION"
+                    echo "Restore Point Collection created."
+                  fi
+                }
+
+                create_restore_point() {
+                  local rp_name="$1"
+                  ensure_rpc_exists
+                  echo "Creating restore point: $rp_name"
+                  local VM_ID
+                  VM_ID=$(az vm show -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" --query id -o tsv)
+                  az restore-point create \
+                    --resource-group "$RESOURCE_GROUP" \
+                    --restore-point-collection-name "$RESTORE_POINT_COLLECTION" \
+                    --name "$rp_name" \
+                    --source-id "$VM_ID"
+                  echo "Restore point '$rp_name' created successfully."
+                  # NOTE: Azure currently captures OS + all attached managed data disks; no CLI flag to exclude selectively.
+                  # If INCLUDE_DATA=false we will still capture them (cannot avoid) but we will note this for transparency.
+                  if [[ "$INCLUDE_DATA" != "true" ]]; then
+                    echo "INFO: includeDataDisks=false requested, but data disks are still captured by Azure restore point (cannot exclude at creation). They will simply not be restored later."
+                  fi
+                  # Verification: list disks captured
+                  echo "Verifying captured disks in restore point '$rp_name'..."
+                  local RP_VERIFY_JSON
+                  if RP_VERIFY_JSON=$(az restore-point show -g "$RESOURCE_GROUP" --restore-point-collection-name "$RESTORE_POINT_COLLECTION" -n "$rp_name" -o json 2>/dev/null); then
+                    local OS_COUNT DATA_COUNT
+                    OS_COUNT=$(echo "$RP_VERIFY_JSON" | jq '[.diskRestorePoints[] | select(.osDisk==true)] | length')
+                    DATA_COUNT=$(echo "$RP_VERIFY_JSON" | jq '[.diskRestorePoints[] | select(.osDisk!=true)] | length')
+                    echo "Captured OS disk count: $OS_COUNT; data disk count: $DATA_COUNT"
+                    if [[ "$DATA_COUNT" -gt 0 ]]; then
+                      echo "Data disks captured:";
+                      echo "$RP_VERIFY_JSON" | jq -r '.diskRestorePoints[] | select(.osDisk!=true) | "  LUN=\(.lun) Name=\(.sourceDisk.name)"'
+                    else
+                      echo "No data disks present in this VM or none captured."
+                    fi
+                  else
+                    echo "WARNING: Unable to fetch restore point details for verification." >&2
+                  fi
+                }
+
+                # Disk-based restore (OS disk) using restore point disk restore point.
+                # NOTE: Reuses the ORIGINAL OS disk name after restore (risk accepted by user).
+                # Approach:
+                #   1. Create temp restored disk from OS disk restore point.
+                #   2. Update VM to reference temp restored disk (while deallocated).
+                #   3. Delete original OS disk (now detached).
+                #   4. Clone temp disk to a new disk having the ORIGINAL name.
+                #   5. Update VM to point to the cloned (original-name) disk.
+                #   6. Delete temp restored disk.
+                #   This incurs extra operations & brief double storage usage.
+                #   If any failure occurs after step 2, the VM still points at the temp disk and original disk still exists unless step 3 succeeded.
+                restore_from_restore_point() {
+                  local rp_name="$1"
+                  echo "Restoring VM from restore point (disk replace method): $rp_name"
+                  # Fetch restore point JSON
+                  local RP_JSON
+                  if ! RP_JSON=$(az restore-point show -g "$RESOURCE_GROUP" --restore-point-collection-name "$RESTORE_POINT_COLLECTION" -n "$rp_name" -o json 2>/dev/null); then
+                    echo "ERROR: Restore point '$rp_name' not found in collection '$RESTORE_POINT_COLLECTION'." >&2
+                    exit 1
+                  fi
+                  # Extract OS disk restore point id (jq expected on hosted agents)
+                  local OS_DISK_RP_ID
+                  OS_DISK_RP_ID=$(echo "$RP_JSON" | jq -r '.diskRestorePoints[] | select(.osDisk==true) | .id')
+                  if [[ -z "$OS_DISK_RP_ID" || "$OS_DISK_RP_ID" == "null" ]]; then
+                    echo "ERROR: Could not locate OS disk restore point inside restore point '$rp_name'." >&2
+                    exit 1
+                  fi
+                  echo "Found OS disk restore point id: $OS_DISK_RP_ID"
+                  # Gather original OS disk info
+                  local ORIG_OS_DISK_ID ORIG_OS_DISK_NAME
+                  ORIG_OS_DISK_ID=$(az vm show -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" --query 'storageProfile.osDisk.managedDisk.id' -o tsv)
+                  ORIG_OS_DISK_NAME=$(basename "$ORIG_OS_DISK_ID")
+                  echo "Original OS disk name: $ORIG_OS_DISK_NAME"
+
+                  # Create temp managed disk from restore point
+                  local TEMP_OS_DISK_NAME="${VM_KEY_RAW}-osrestored-temp-${rp_name}"
+                  echo "Creating temporary restored disk '$TEMP_OS_DISK_NAME'..."
+                  az disk create -g "$RESOURCE_GROUP" -n "$TEMP_OS_DISK_NAME" --location "$LOCATION" --source "$OS_DISK_RP_ID" >/dev/null
+                  local TEMP_OS_DISK_ID
+                  TEMP_OS_DISK_ID=$(az disk show -g "$RESOURCE_GROUP" -n "$TEMP_OS_DISK_NAME" --query id -o tsv)
+                  if [[ -z "$TEMP_OS_DISK_ID" ]]; then
+                    echo "ERROR: Failed to create temporary restored OS disk." >&2
+                    exit 1
+                  fi
+                  echo "Temporary restored disk created: $TEMP_OS_DISK_ID"
+
+                  # Point VM to temp disk
+                  echo "Pointing VM to temporary restored disk..."
+                  az vm update -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" --set storageProfile.osDisk.managedDisk.id="$TEMP_OS_DISK_ID" >/dev/null
+                  echo "VM now references temporary restored disk."
+
+                  # Delete original disk to free name
+                  echo "Deleting original OS disk '$ORIG_OS_DISK_NAME' to reuse name..."
+                  az disk delete -g "$RESOURCE_GROUP" -n "$ORIG_OS_DISK_NAME" --yes >/dev/null || {
+                    echo "ERROR: Failed to delete original OS disk; aborting name reuse sequence." >&2
+                    exit 1
+                  }
+                  echo "Original OS disk deleted. Recreating with original name from temp disk..."
+
+                  # Clone temp disk to original name
+                  az disk create -g "$RESOURCE_GROUP" -n "$ORIG_OS_DISK_NAME" --location "$LOCATION" --source "$TEMP_OS_DISK_ID" >/dev/null
+                  local CLONED_OS_DISK_ID
+                  CLONED_OS_DISK_ID=$(az disk show -g "$RESOURCE_GROUP" -n "$ORIG_OS_DISK_NAME" --query id -o tsv)
+                  if [[ -z "$CLONED_OS_DISK_ID" ]]; then
+                    echo "ERROR: Failed to recreate disk with original name." >&2
+                    exit 1
+                  fi
+                  echo "Recreated disk with original name: $CLONED_OS_DISK_ID"
+
+                  # Update VM to use cloned original-name disk
+                  echo "Updating VM to use original-name disk again..."
+                  az vm update -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" --set storageProfile.osDisk.managedDisk.id="$CLONED_OS_DISK_ID" >/dev/null
+                  echo "VM now references disk with original name '$ORIG_OS_DISK_NAME'."
+
+                  # Delete temp disk
+                  echo "Cleaning up temporary disk '$TEMP_OS_DISK_NAME'..."
+                  az disk delete -g "$RESOURCE_GROUP" -n "$TEMP_OS_DISK_NAME" --yes >/dev/null || echo "WARNING: Failed to delete temp disk '$TEMP_OS_DISK_NAME'. Manual cleanup may be required."
+                  echo "Restore with original disk name completed."
+
+                  # --- Data Disk Restoration (Optional, Consolidated Updates) ---
+                  if [[ "$INCLUDE_DATA" == 'true' ]]; then
+                    echo "Beginning consolidated data disk restoration (detach all, recreate, bulk attach)..."
+                    mapfile -t DATA_DISK_LINES < <(echo "$RP_JSON" | jq -r '.diskRestorePoints[] | select(.osDisk!=true) | "\(.lun)|\(.id)|\(.sourceDisk.name)"')
+                    if (( ${#DATA_DISK_LINES[@]} == 0 )); then
+                      echo "No data disk restore points found; skipping data disk restoration."
+                    else
+                      # Capture existing VM dataDisks for mapping LUN->original disk name (safety if names differ)
+                      local VM_DATA_JSON
+                      VM_DATA_JSON=$(az vm show -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" -o json)
+                      # Detach all data disks in one update (set empty array)
+                      echo "Detaching all existing data disks (single update)..."
+                      az vm update -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" --set storageProfile.dataDisks=[] >/dev/null
+
+                      # For each restore point entry: delete original disk, recreate from restore point with original name
+                      local FINAL_DATA_DISKS_JSON='[]'
+                      for entry in "${DATA_DISK_LINES[@]}"; do
+                        IFS='|' read -r LUN DISK_RP_ID SRC_DISK_NAME <<< "$entry"
+                        echo "Restoring data disk LUN=$LUN originalName=$SRC_DISK_NAME"
+                        # Original disk may still exist (now detached); delete to free name
+                        if az disk show -g "$RESOURCE_GROUP" -n "$SRC_DISK_NAME" >/dev/null 2>&1; then
+                          echo "Deleting detached original data disk $SRC_DISK_NAME..."
+                          az disk delete -g "$RESOURCE_GROUP" -n "$SRC_DISK_NAME" --yes >/dev/null || { echo "ERROR: Failed to delete original data disk $SRC_DISK_NAME" >&2; exit 1; }
+                        else
+                          echo "Original data disk $SRC_DISK_NAME not found (may have been previously removed)."
+                        fi
+                        echo "Creating restored data disk $SRC_DISK_NAME from restore point..."
+                        az disk create -g "$RESOURCE_GROUP" -n "$SRC_DISK_NAME" --location "$LOCATION" --source "$DISK_RP_ID" >/dev/null
+                        local NEW_DATA_DISK_ID
+                        NEW_DATA_DISK_ID=$(az disk show -g "$RESOURCE_GROUP" -n "$SRC_DISK_NAME" --query id -o tsv)
+                        if [[ -z "$NEW_DATA_DISK_ID" ]]; then
+                          echo "ERROR: Failed to create restored data disk $SRC_DISK_NAME" >&2; exit 1; fi
+                        # Append entry to final data disks JSON array
+                        FINAL_DATA_DISKS_JSON=$(echo "$FINAL_DATA_DISKS_JSON" | jq --arg id "$NEW_DATA_DISK_ID" --arg name "$SRC_DISK_NAME" --argjson lun "$LUN" '. + [{lun:$lun, name:$name, createOption:"Attach", managedDisk:{id:$id}}]')
+                      done
+                      echo "Attaching all restored data disks in one update..."
+                      az vm update -g "$RESOURCE_GROUP" -n "$VM_KEY_RAW" --set storageProfile.dataDisks="$(echo "$FINAL_DATA_DISKS_JSON" | jq -c '.')" >/dev/null
+                      echo "Data disk restoration complete (consolidated)."
+                    fi
+                  else
+                    echo "Data disk restoration skipped (includeDataDisks=false)."
+                  fi
+                }
+
+                case "$ACTION" in
+                  create)
+                    shutdown_vm
+                    create_restore_point "$NEW_RP_NAME"
+                    ;;
+                  restore)
+                    shutdown_vm
+                    restore_from_restore_point "$EXISTING_RP_NAME"
+                    ;;
+                  both)
+                    shutdown_vm
+                    create_restore_point "$NEW_RP_NAME"
+                    restore_from_restore_point "$EXISTING_RP_NAME"
+                    ;;
+                  *)
+                    echo "ERROR: Invalid action '$ACTION'" >&2
+                    exit 1
+                    ;;
+                esac
+
+                if [[ "$ACTION" == "restore" || "$ACTION" == "both" ]]; then
+                  if [[ "$START_AFTER" == "true" ]]; then
+                    echo "Starting VM after operations..."
+                    az vm start --resource-group "$RESOURCE_GROUP" --name "$VM_KEY_RAW"
+                    echo "VM started successfully."
+                  else
+                    echo "VM left deallocated per user preference."
+                  fi
+                fi
+
+                echo "VM Restore Point Management completed."
+            failOnStandardError: true
+            condition: succeededOrFailed()
+
+          - task: PowerShell@2
+            displayName: "Post-Action Notification"
+            inputs:
+              targetType: "inline"
+              script: |
+                Write-Host "VM Restore Point Management process has completed."
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "There were errors during the process. Please check the logs above for details."
+                } else {
+                  Write-Host "Process completed successfully."
+                }
+
+            condition: always()
+            failOnStderr: false
+            continueOnError: true
